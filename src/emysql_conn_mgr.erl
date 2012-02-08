@@ -31,7 +31,7 @@
 -export([pools/0, waiting/0, add_pool/1, remove_pool/1,
 		add_connections/2, remove_connections/2,
 		lock_connection/1, wait_for_connection/1,
-		pass_connection/1, 
+		pass_connection/1,
 		replace_connection_as_available/2, replace_connection_as_locked/2,
 		find_pool/3]).
 
@@ -79,7 +79,7 @@ wait_for_connection(PoolId)->
             %-% io:format("~p is queued~n", [self()]),
 			gen_server:call(?MODULE, start_wait, infinity),
 			receive
-				{connection, Connection} -> 
+				{connection, Connection} ->
                     %-% io:format("~p gets a connection after waiting in queue~n", [self()]),
     				Connection
 			after lock_timeout() ->
@@ -191,7 +191,11 @@ handle_call(start_wait, {From, _Mref}, State) ->
 	%% place to calling pid at the end of the waiting queue
 	State1 = State#state{
 		waiting = queue:in(From, State#state.waiting)
-	},
+			},
+    %% Patch with integration my emysql monitor
+	emysql_mon:monitor(queue:len(waiting)),
+    %% Patch with integration my emysql monitor
+
 	{reply, ok, State1};
 
 handle_call({lock_connection, PoolId}, _From, State) ->
