@@ -7,9 +7,11 @@
 			{queue_size=0,			% Current Queue size
 			high_watermark=10,		% High watermark
 			onoff=false,			% Is monitor active ?
-			trap_sent=false,		% Was high-watermark trap sent ?
+			curr_state=false,		% Current state of defect (raise=true, clear=false)
+			next_state=false,	    % Next state of defect (raise=true, clear=false)
 		   	f1filter=1000,			% f1 filter configuration (both for clear and raise)
-			filterpid=false			% Pid of the filter process
+			filterpid=false,		% Pid of the filter process
+			last_trap=false			% Last trap sent
 			}).
 
 %% ------------------------------------------------------------------
@@ -27,10 +29,6 @@
 
 -export([test/0]).
 
--ifdef(XTESTS).
--export([start_test/0]).
--endif.
-
 %% ------------------------------------------------------------------
 %% API Function Definitions
 %% ------------------------------------------------------------------
@@ -42,14 +40,16 @@ start_link() ->
 %% Exposed emysql_monitor API Function
 %% ------------------------------------------------------------------
 get_state() ->
-	{state,QueueSize,Watermark,OnOff,TrapSent,F1Filter,FilterPid} = gen_server:call(?MODULE,get_state),
+	{state,QueueSize,Watermark,OnOff,CurrRaiseClear,NextRaiseClear,F1Filter,FilterPid,Last} = gen_server:call(?MODULE,get_state),
  	gen_server:call(?MODULE,get_state),
  	io:format("Queue size:~p~n",[QueueSize]),
 	io:format("Watermark: ~p~n",[Watermark]),
 	io:format("Enabled:   ~p~n",[OnOff]),
-	io:format("Trap sent: ~p~n",[TrapSent]),
-    io:format("filter(s): ~p~n",[F1Filter]),
-    io:format("filterPid: ~p~n",[FilterPid]).
+	io:format("Current St:~p~n",[CurrRaiseClear]),
+	io:format("Next State:~p~n",[NextRaiseClear]),
+    io:format("Filter(s): ~p~n",[F1Filter]),
+    io:format("FilterPid: ~p~n",[FilterPid]),
+    io:format("Last:	  ~p~n",[Last]).
 
 monitor(QueueS) ->
 	gen_server:call(?MODULE,{monitor, QueueS}).
@@ -68,7 +68,8 @@ set_f1filter(F1Filter) ->
 %% -----------------------------------------------------------------
 
 init([]) ->
-	{ok, #state {queue_size=0, high_watermark=10, onoff=false, trap_sent=false, f1filter=1000}}.
+	{ok, #state {queue_size=0, high_watermark=101, onoff=false, curr_state=false, next_state=false, f1filter=1000,
+			filterpid=false, last_trap=false}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -97,32 +98,38 @@ handle_cast(_Request, State) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_call({set_enable, OnOff}, From, State) ->
-	io:format("Just received set_enable[~p]~n",[OnOff]),
+handle_call({set_enable, OnOff}, _From, State) ->
+	?debugFmt("Just received set_enable[~p]~n",[OnOff]),
     if State#state.onoff =/= OnOff ->
-    		NewState=State#state{onoff=OnOff},
-			%io:format("[~p]~n",[NewState]),
-			trap_processing(NewState#state.queue_size, From, NewState),
+			NewState=defect_processing(State#state{onoff=OnOff}),
     		{reply, ok, NewState};
     	true ->
 			{reply, ok, State}
 	end;
 
-handle_call({set_watermark, QueueS}, From, State) ->
-	io:format("Just received set_watermark[~p]~n",[QueueS]),
+handle_call({set_watermark, QueueS}, _From, State) ->
+	?debugFmt("Just received set_watermark[~p]~n",[QueueS]),
     if State#state.high_watermark =/= QueueS ->
-    		NewState=State#state{high_watermark=QueueS},
-			trap_processing(NewState#state.queue_size, From, NewState),
+			NewState=defect_processing(State#state{high_watermark=QueueS}),
+    		{reply, ok, NewState};
+    	true ->
+			{reply, ok, State}
+	end;
+
+handle_call({set_filter, Miliseconds}, _From, State) ->
+	?debugFmt("Just received set_filter[~p]~n",[Miliseconds]),
+    if State#state.f1filter =/= Miliseconds ->
+			NewState=(State#state{f1filter=Miliseconds}),
     		{reply, ok, NewState};
     	true ->
 			{reply, ok, State}
 	end;
 
 handle_call({monitor, QueueS}, From, State) ->
-	io:format("Just received monitor[~p,~p,~p]~n",[QueueS, From,State]),
+	?debugFmt("Just received monitor[~p,~p,~p]~n",[QueueS, From,State]),
 	if State#state.onoff == true ->
-			NewState = trap_processing(QueueS, From, State),
-			{reply, ok, NewState#state{queue_size=QueueS}};
+			NewState=defect_processing(State#state{queue_size=QueueS}),
+			{reply, ok, NewState};
 		true ->
 			{reply, ok, State#state{queue_size=QueueS}}
 	end;
@@ -130,32 +137,40 @@ handle_call({monitor, QueueS}, From, State) ->
 handle_call(get_state, _From, State) ->
 	{reply,State,State}.
 
-
 %%--------------------------------------------------------------------
 %% @private
 %% @doc
-%% Handling of traps. Processes traps, sends them if required and sends
-%%					  the new state when the trap state updated.
+%% Handling of defect. Processes the defect, by spwaning a new process
+%% to integrate into a real alarm.
+%% The FSM state change is done here!
 %%
-%% @spec trap_processing(QueueS, _From, State) -> NewState
+%% @spec defect_processing(State) -> NewState
 %% @end
 %%--------------------------------------------------------------------
-trap_processing(QueueS, _From, State) ->
-	% Trap was not sent and the watermark was just overtrown
-	% -> Sent rasing alarm
+defect_processing(State) ->
+	?debugFmt("Current state:~p~n",[State]),
+	% 1. State transition: (No alarm -> Alarm)
+	% -> Start integrating defect in order to send rasing alarm
 	if State#state.onoff == true andalso
-       State#state.high_watermark < QueueS andalso
-       State#state.trap_sent == false ->
-			%io:format("Trap up~n",[]),
-			start_filter(State#state{trap_sent=true});
-	% Trap was already sent and the watermark was just undertrown
-	% -> Sent lowering alarm
-	   State#state.onoff == true andalso
-	   State#state.high_watermark >= QueueS andalso
-	   State#state.trap_sent == true ->
-			%io:format("Trap down~n",[]),
-    		start_filter(State#state{trap_sent=false});
-    	true ->
+       State#state.high_watermark < State#state.queue_size andalso
+       State#state.curr_state == false ->
+			?debugFmt("State transition C->R~n",[]),
+			start_filter(State#state{next_state=true});
+	% State transition: (Raised being integrated -> Cleared)
+    % -> Start integrating defect in order to send clear alarm
+       State#state.onoff == true andalso
+	   State#state.high_watermark >= State#state.queue_size andalso
+       State#state.curr_state == true ->
+			?debugFmt("State transition R->C~n",[]),
+			start_filter(State#state{next_state=false});
+	% State transition: (Disabled and Alarm is Raised)
+	% -> Clear alarm at once
+       State#state.onoff == false andalso
+       State#state.curr_state == true ->
+			?debugFmt("State transition with defect being raised (disabled)~n",[]),
+			start_filter(State#state{next_state=false});
+	   true ->
+			?debugFmt("Did not process state: ~p~n",[State]),
 			State
 	end.
 
@@ -170,9 +185,10 @@ trap_processing(QueueS, _From, State) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_info({emysql_monitor_trap, TrapValue}, State) ->
-	io:format("Just received trap:~p~p~n",[TrapValue,State]),
-    {noreply, State}.
+handle_info({emysql_monitor_trap, TrapState}, State) ->
+	?debugFmt("Just received trap:~p|~p~n",[TrapState,State]),
+	NewState=State#state{last_trap=TrapState},
+    {noreply, NewState}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -203,21 +219,38 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
 
-start_filter(InitialState) ->
+start_filter(State) ->
+
 	% Cancel any active filter process from still active integration
 	% eg. Trap was being integrated for raise and then now was involked
 	% to be integrated for clear
-	if InitialState#state.filterpid =/= false ->
-			catch exit(InitialState#state.filterpid);
-			true -> ok
+	if State#state.filterpid =/= false ->
+			%io:format("Pid~p ~n",[State]),
+			State#state.filterpid ! {self(), abort_integration},
+			catch exit(State#state.filterpid);
+		true -> ok
 	end,
 
-	Pid = spawn(fun() -> filter_process(0) end),
-	%io:format("FilterPid:~p~n",[Pid]),
-	% Start the integration inside the spwaned process
-	Pid ! {self(), {start_integration, InitialState}},
-	InitialState#state{filterpid=Pid}.
+	NextState=State#state{curr_state=State#state.next_state},
 
+	%io:format("start_filter state ~p@~p~n",[State,NextState]),
+	if (State#state.next_state == State#state.last_trap) ->
+		%io:format("States are the same"),
+		NextState;
+	   State#state.onoff == true ->
+		Pid = spawn(fun() -> filter_process(0) end),
+		%io:format("FilterPid:~p~n",[Pid]),
+		% Start the integration inside the spwaned process
+		_Result = Pid ! {self(), {start_integration, State}}, State#state{filterpid=Pid},
+		NextState#state{filterpid=Pid};
+	% Just disable the monitoring.
+	   State#state.onoff == false andalso
+	   State#state.next_state == false andalso
+	   State#state.curr_state == true ->
+		self() !  {emysql_monitor_trap, NextState#state.next_state},
+		NextState;
+	true -> NextState
+	end.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -233,20 +266,21 @@ start_filter(InitialState) ->
 filter_process(PState) ->
 	receive
 		{_From, {start_integration, State}} ->
-		    io:format("Starting integration of defect timer: ~p ~n",[State]),
-			{ok, TRef} = timer:send_after(State#state.f1filter, {_From, {send_trap, State#state.trap_sent}}),
+		    ?debugFmt("Starting integration of defect timer: ~p ~n",[State]),
+			{ok, TRef} = timer:send_after(State#state.f1filter, {_From, {send_trap, State#state.next_state}}),
 			%io:format("Ret:~p~n",[TRef]),
 			filter_process(TRef);
-		{_From, {abort_integration}} ->
-		    io:format("Canceling integration of defect~n",[]),
+		{_From, abort_integration} ->
+		    ?debugFmt("Canceling integration of defect~n",[]),
 		    timer:cancel(PState),
 		    catch exit(aborted);
-		{From, {send_trap, TrapState}} ->
-		    io:format("Sending trap to server ~n",[]),
-			From ! {emysql_monitor_trap, TrapState},
+		{_From, {send_trap, TrapState}} ->
+		    ?debugFmt("Sending trap to server ~n",[]),
+			_From ! {emysql_monitor_trap, TrapState},
 			catch exit(ok);
 		Other ->
-			io:format("Just cought crap:~p ~n",[Other])
+			?debugFmt("Just an unkown message in filter_process:~p ~n",[Other]),
+			filter_process(PState)
 	end.
 
 -ifdef(TEST).
@@ -262,9 +296,10 @@ filter_process(PState) ->
 %% @spec test() -> ok | error
 %% @end
 %%--------------------------------------------------------------------
-
 test() ->
 	?debugFmt("Running eunit tests~n for module ~s~n",[?MODULE]),
+	% 0. Init
+	init([]),
     % 0. Get state
 	emysql_mon:get_state(),
     % 1. Enable monitoring and set watermark
@@ -272,11 +307,14 @@ test() ->
 	emysql_mon:set_watermark(10),
     % 2. Set queue size to 20 -> Trap TRUE sent
 	emysql_mon:monitor(20),
-	timer:sleep(3000),
+	emysql_mon:get_state(),
+	timer:sleep(5000),
     % 3. Set queue size to 9 -> Trap FALSE sent
 	emysql_mon:monitor(9),
-	timer:sleep(3000),
+	emysql_mon:get_state(),
+	timer:sleep(5000),
     % 4. Disable monitoring
+	emysql_mon:get_state(),
 	emysql_mon:set_enable(false),
     % 5. Set queue size to 20 -> Nothing happens
 	emysql_mon:monitor(20),
@@ -286,17 +324,5 @@ test() ->
 	emysql_mon:set_enable(false),
     % 8. Get state
 	emysql_mon:get_state().
-
--ifdef(XTESTS).
-%%% Tests
-start_test() ->
-	Pid = spawn(fun() -> test_spawn() end),
-	io:format("Just created the process:~p ~n",[Pid]),
-	exit(Pid),
-	io:format("Just killed the process:~p ~n",[Pid]).
-
-test_spawn()->
-	io:format("pedro is spawning processes").
--endif.
 
 -endif.
